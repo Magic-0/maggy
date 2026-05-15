@@ -4,7 +4,7 @@
 
 This project started as **Claude Bootstrap** — an opinionated set of skills, hooks, and rules for Claude Code. Over time it grew into something much bigger: a multi-model routing system, a persistent memory layer, an intent-tracking code graph, container-based orchestration, and a full engineering command center. The bootstrap scaffolding is still here, but the future of this project is **Maggy** — an autonomous engineering system that routes work across AI models, learns from outcomes, and manages the full development lifecycle.
 
-62 skills, TDD enforcement via Stop hooks, agent teams, persistent memory (Mnemos), intent tracking (iCPG), and multi-model AI command center. Works with **Claude Code**, **Kimi CLI**, and **OpenAI Codex CLI**.
+64 skills, TDD enforcement via Stop hooks, agent teams, persistent memory (Mnemos), intent tracking (iCPG), and multi-model AI command center. Works with **Claude Code**, **Kimi CLI**, and **OpenAI Codex CLI**.
 
 ## Quick Start
 
@@ -46,14 +46,14 @@ The original scaffolding that sets up any project for AI-assisted development:
 
 | Layer | What | Why |
 |-------|------|-----|
-| **Skills** | 62 skills loaded via `@include` in CLAUDE.md | Language, framework, security, AI patterns |
+| **Skills** | 64 skills loaded via `@include` in CLAUDE.md | Language, framework, security, AI patterns |
 | **Rules** | Conditional rules (activate by file path) | Quality gates, TDD workflow, security — only when relevant |
 | **Hooks** | Stop hooks for TDD loops | Tests run after every Claude response, failures feed back automatically |
 | **Agents** | Team Lead + Quality + Security + Review + Merger + Feature | Coordinated pipeline: spec → test → implement → review → PR |
 | **Memory** | Mnemos (typed graph on disk) | Survives compaction, crashes, restarts |
 | **Intent** | iCPG (code property graph) | Tracks *why* code exists, detects drift |
 
-## Skills (62)
+## Skills (64)
 
 **Core** — TDD, memory, intent tracking, code review, agent teams, security, commit hygiene, cross-agent delegation, Polyphony orchestration
 
@@ -63,11 +63,11 @@ The original scaffolding that sets up any project for AI-assisted development:
 
 **AI** — Agentic development, LLM patterns, AI models reference
 
-**UI** — Web (Tailwind), mobile, visual testing, Playwright, PWA
+**UI** — Web (Tailwind), mobile, visual testing, Playwright, PWA, UI/UX Pro Max (67 styles · 161 palettes · 57 typographies), WebGPU/Three.js TSL
 
 **Integrations** — Stripe, Reddit, Shopify, WooCommerce, Medusa, Klaviyo, Teams, PostHog
 
-See [full skills catalog](./docs/claude-bootstrap-reference.md#skills-catalog-62-skills) for details.
+See [full skills catalog](./docs/claude-bootstrap-reference.md#skills-catalog-64-skills) for details.
 
 ## Cross-Tool Compatibility
 

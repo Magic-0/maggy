@@ -256,7 +256,7 @@ your-project/
 └── CLAUDE.local.md           # Private developer overrides (gitignored)
 ```
 
-## Skills Catalog (62 Skills)
+## Skills Catalog (64 Skills)
 
 ### Core
 | Skill | Purpose |
@@ -290,6 +290,12 @@ your-project/
 
 ### UI
 `ui-web.md` · `ui-mobile.md` · `ui-testing.md` · `playwright-testing.md` · `user-journeys.md` · `pwa-development.md`
+
+**Custom skills (Magic-0/maggy fork)**
+| Skill | Purpose |
+|-------|---------|
+| `ui-ux-pro-max/` | Design intelligence — 67 styles UI, 161 palettes couleur, 57 pairages typographiques, 99 guidelines UX, 25 types de graphiques. Moteur de recherche BM25 + génération de design system. 15+ tech stacks. |
+| `webgpu-threejs-tsl/` | WebGPU + Three.js Shading Language — setup renderer, shaders TSL, materials node, compute shaders, post-processing, intégration WGSL. Docs, exemples, templates inclus. |
 
 ### Database & Backend
 `database-schema.md` · `supabase.md` · `supabase-nextjs.md` · `supabase-python.md` · `supabase-node.md` · `firebase.md` · `cloudflare-d1.md` · `aws-dynamodb.md` · `aws-aurora.md` · `azure-cosmosdb.md`
