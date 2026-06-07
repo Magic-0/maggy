@@ -416,6 +416,65 @@ if (!filePath.startsWith(path.resolve('./uploads'))) {
 
 ## Authentication & Authorization
 
+### Mode Cookie Isolation (demo / preview / guest)
+
+A mode cookie (`demo`, `preview`, `guest`…) and a real session cookie must **never coexist**. When both are present simultaneously, read guards return mode fixtures while write guards see `hasValidSession → true` — meaning mode actions write to the real database (spurious notifications, data corruption, etc.).
+
+**4 mandatory rules:**
+
+1. **Entering a mode → revoke the real session first.** The mode entry route (`/api/auth/demo`, `/api/auth/preview`…) must read the session token, revoke it in the database, and clear its cookie BEFORE setting the mode cookie.
+
+2. **Login → clear the mode cookie.** `issueSessionResponse` (and every session-issuance code path, including 2FA) must call `clearModeCookie(response)`. Guarantees that even if rule #1 failed, logging in normalises the state.
+
+3. **Write routes → mode guard BEFORE session guard.** On every `POST`/`PATCH`/`DELETE` handler, check `isDemoRequest(req)` first. If in mode → return without touching the database. Never let `hasValidSession` alone decide writes when a mode cookie may be present.
+
+4. **Mode logout = PUBLIC route.** The logout route must bypass the session middleware (`PUBLIC_PATHS` or equivalent). Without this, a `POST` from inside the mode (no real session) is blocked by the proxy and the mode cookie can never be cleared.
+
+```typescript
+// ✅ CORRECT — mode entry: revoke real session first
+export async function POST(req: Request) {
+  const response = NextResponse.json({ ok: true })
+  const token = readSessionToken(req)
+  if (token) {
+    try { await revokeSessionByToken(token) } catch {}
+    response.cookies.set(SESSION_COOKIE_NAME, "", { maxAge: 0, path: "/" })
+  }
+  return setModeCookie(response)
+}
+
+// ✅ CORRECT — login: clear mode cookie on session issuance
+async function issueSessionResponse(...): Promise<NextResponse> {
+  // ... set real session cookie ...
+  return clearModeCookie(response)  // ← always, last line
+}
+
+// ✅ CORRECT — write route: mode guard before session guard
+export async function POST(req: Request) {
+  if (isDemoRequest(req)) return NextResponse.json({ ok: true })  // ← first check
+  if (!(await hasValidSession(req))) return unauthorized()
+  // ... DB write only if real session confirmed ...
+}
+
+// ❌ WRONG — mode entry without clearing the existing session
+export async function POST() {
+  return setModeCookie(NextResponse.json({ ok: true }))  // real session still valid!
+}
+
+// ❌ WRONG — write route without mode guard
+export async function POST(req: Request) {
+  if (!(await hasValidSession(req))) return unauthorized()  // session valid in demo → write!
+  await db`INSERT INTO ...`
+}
+```
+
+**Anti-patterns:**
+- ❌ Setting a mode cookie without revoking the existing real session
+- ❌ Checking `hasValidSession` before `isDemoRequest` on write routes
+- ❌ Mode logout guarded by the proxy (non-public route → POST blocked from within the mode)
+- ❌ `issueSessionResponse` that does not clear active mode cookies
+
+---
+
 ### JWT Best Practices
 
 ```typescript
@@ -542,6 +601,9 @@ Run before every release:
 - [ ] JWTs use short expiration
 - [ ] Rate limiting on auth endpoints
 - [ ] Session tokens rotated on login
+- [ ] Mode isolation: entering a mode revokes real session; login clears mode cookie
+- [ ] Write routes: mode guard (`isDemoRequest`…) checked BEFORE `hasValidSession`
+- [ ] Mode logout route is PUBLIC (reachable without a real session)
 
 ### Database
 - [ ] Parameterized queries only
@@ -578,3 +640,7 @@ Run before every release:
 - ❌ Running as root / admin in production
 - ❌ Hardcoded credentials for any environment
 - ❌ Disabling SSL/TLS verification
+- ❌ Mode cookie set without revoking the existing real session (coexistence → real DB writes from mode)
+- ❌ `hasValidSession` checked before mode guard on write routes (valid session + demo cookie → leak)
+- ❌ Mode logout route not in PUBLIC paths (proxy blocks the POST → mode cookie can never be cleared)
+- ❌ `issueSessionResponse` without `clearModeCookie` (old mode cookie survives normal login)
