@@ -439,7 +439,13 @@ response.cookies.set("session", token, {
 
 ---
 
-### Isolation des modes (démo / preview / guest)
+### Isolation des contextes d'identité (modes & multi-tenant)
+
+**Principe fondamental** : deux contextes d'identité actifs ne doivent jamais coexister de façon ambiguë. Quand deux cookies ou flags de contexte sont présents simultanément (mode démo + session réelle, tenant A + tenant B…), les guards lisent des sources différentes et s'accordent des permissions contradictoires — la faille émerge dans l'écart.
+
+---
+
+#### Modes (démo / preview / guest)
 
 Un cookie de mode (`demo`, `preview`, `guest`…) et un cookie de session réelle ne doivent **jamais coexister**. La coexistence crée une ambiguïté dangereuse : les guards de lecture retournent des fixtures démo, mais les guards d'écriture voient `hasValidSession → true` → les actions du mode écrivent en DB réelle (notifications parasites, données corrompues…).
 
@@ -454,7 +460,7 @@ Un cookie de mode (`demo`, `preview`, `guest`…) et un cookie de session réell
 4. **Logout du mode = route PUBLIC** : la route de logout doit bypasser le middleware de session (`PUBLIC_PATHS` ou équivalent). Sans ça, un POST de logout depuis le mode (sans vraie session) est bloqué par le proxy, le cookie de mode ne peut jamais être effacé.
 
 ```typescript
-// ✅ CORRECT — entrée en mode : révoque la session réelle en premier
+// ✅ CORRECT — mode entry: revoke real session first
 export async function POST(req: Request) {
   const response = NextResponse.json({ ok: true })
   const token = readSessionToken(req)
@@ -465,36 +471,96 @@ export async function POST(req: Request) {
   return setModeCookie(response)
 }
 
-// ✅ CORRECT — login : purge le cookie de mode
+// ✅ CORRECT — login: clear mode cookie on session issuance
 async function issueSessionResponse(...): Promise<NextResponse> {
-  // ... générer et poser le vrai cookie session ...
-  return clearModeCookie(response)  // ← toujours, en dernier
+  // ... set real session cookie ...
+  return clearModeCookie(response)  // ← always, last line
 }
 
-// ✅ CORRECT — route write : mode guard en premier, avant session guard
+// ✅ CORRECT — write route: mode guard before session guard
 export async function POST(req: Request) {
-  if (isDemoRequest(req)) return NextResponse.json({ ok: true })  // ← prioritaire
+  if (isDemoRequest(req)) return NextResponse.json({ ok: true })  // ← first check
   if (!(await hasValidSession(req))) return unauthorized()
-  // ... écriture DB uniquement si vraie session confirmée ...
-}
-
-// ❌ MAUVAIS — entrée en mode sans effacer la session
-export async function POST() {
-  return setModeCookie(NextResponse.json({ ok: true }))  // e208_session toujours valide!
-}
-
-// ❌ MAUVAIS — write route sans mode guard
-export async function POST(req: Request) {
-  if (!(await hasValidSession(req))) return unauthorized()  // session valide en démo → écriture!
-  await db`INSERT INTO ...`
+  // ... DB write only if real session confirmed ...
 }
 ```
 
-**Anti-patterns :**
+**Anti-patterns modes :**
 - ❌ Poser un cookie de mode sans effacer le cookie session existant
 - ❌ Vérifier `hasValidSession` AVANT `isDemoRequest` sur les routes d'écriture
 - ❌ Logout du mode gardé par le proxy (route non-publique → POST bloqué depuis le mode)
 - ❌ `issueSessionResponse` qui ne purge pas les cookies de mode actifs
+
+---
+
+#### Multi-tenant
+
+En architecture multi-tenant, le `tenant_id` courant est une **dimension d'autorisation** aussi critique que la session elle-même. Un `tenant_id` mal isolé permet à un utilisateur légitime d'accéder aux données d'un autre tenant sans jamais contourner l'authentification.
+
+**4 règles non négociables :**
+
+1. **Tenant context dans la session (DB), jamais dans un cookie séparé** : un cookie `tenant_id` non-httpOnly est falsifiable côté client. Lier le tenant à la session en base — la session *est* le contexte tenant, pas un cookie annexe.
+
+2. **Changement de tenant → nouvelle session** : révoquer la session tenant-A, émettre une nouvelle session scoped tenant-B. Ne jamais juste modifier un cookie `current_tenant` : la session resterait valide pour le mauvais contexte.
+
+3. **Toutes les queries DB scopées sur le tenant de la session** : ne jamais prendre `tenantId` du body ou des params URL pour scoper les requêtes. Toujours le lire depuis la session en DB, côté serveur.
+
+4. **Impersonation admin = mode à part entière** : si un admin peut "agir comme" un tenant, appliquer les mêmes 4 règles que le mode démo (révoquer sa propre session, cookie d'impersonation dédié, write guard en premier, logout public).
+
+```typescript
+// ✅ CORRECT — tenant_id always from session, never from body
+export async function POST(req: Request) {
+  const session = await requireSession(req)   // { userId, tenantId }
+  if (!session) return unauthorized()
+  const { name } = await parseBody(req, schema)
+  await db`INSERT INTO projects (name, tenant_id) VALUES (${name}, ${session.tenantId})`
+}
+
+// ✅ CORRECT — scope mutations to session tenant
+export async function DELETE(req: Request, { params }: Ctx) {
+  const session = await requireSession(req)
+  if (!session) return unauthorized()
+  const { id } = await params
+  const deleted = await db`
+    DELETE FROM projects WHERE id = ${id} AND tenant_id = ${session.tenantId}
+  `
+  if (deleted.count === 0) return notFound()   // nonexistent OR wrong tenant
+  return NextResponse.json({ ok: true })
+}
+
+// ✅ CORRECT — tenant switch: revoke old session, issue new one scoped to target
+export async function POST(req: Request) {
+  const session = await requireSession(req)
+  if (!session) return unauthorized()
+  const { targetTenantId } = await parseBody(req, switchSchema)
+  const membership = await db`
+    SELECT 1 FROM tenant_members WHERE user_id = ${session.userId} AND tenant_id = ${targetTenantId}
+  `
+  if (!membership.length) return forbidden()
+  await revokeSession(session.token)
+  return issueSessionResponse({ userId: session.userId, tenantId: targetTenantId })
+}
+
+// ❌ WRONG — tenant_id from body (attacker can inject any tenant)
+export async function POST(req: Request) {
+  const { name, tenantId } = await req.json()
+  await db`INSERT INTO projects (name, tenant_id) VALUES (${name}, ${tenantId})`
+}
+
+// ❌ WRONG — DELETE without tenant scope (cross-tenant deletion possible)
+export async function DELETE(req: Request, { params }: Ctx) {
+  const session = await requireSession(req)
+  if (!session) return unauthorized()
+  await db`DELETE FROM projects WHERE id = ${(await params).id}`  // any tenant!
+}
+```
+
+**Anti-patterns multi-tenant :**
+- ❌ `tenant_id` dans un cookie séparé, surtout non-httpOnly (falsifiable côté client)
+- ❌ Changer de tenant en modifiant juste un cookie `current_tenant` sans révoquer la session
+- ❌ Lire `tenantId` du body/params URL pour scoper les queries (injection de tenant)
+- ❌ `WHERE id = ?` sans `AND tenant_id = ?` sur les mutations (cross-tenant write/delete)
+- ❌ Impersonation admin sans isolation de contexte (admin écrit avec ses propres droits sur le tenant cible)
 
 ---
 
@@ -899,6 +965,10 @@ Run before every release:
 - [ ] Isolation des modes : entrée en mode → session révoquée ; login → cookie de mode effacé
 - [ ] Routes d'écriture : mode guard (`isDemoRequest`…) vérifié AVANT `hasValidSession`
 - [ ] Logout du mode dans `PUBLIC_PATHS` (atteignable sans vraie session)
+- [ ] Multi-tenant : `tenant_id` lié à la session en DB (jamais cookie séparé)
+- [ ] Multi-tenant : toutes les queries scopées sur le tenant de la session (pas du body)
+- [ ] Multi-tenant : `WHERE id = ? AND tenant_id = ?` sur toutes les mutations
+- [ ] Multi-tenant : changement de tenant → nouvelle session (pas juste un cookie swappé)
 - [ ] Auth par email uniquement (pas username) — anti-enumeration
 - [ ] Message d'erreur générique "Identifiants incorrects" (pas email/password distinct)
 - [ ] Timing attack mitigé : hash factice si user inconnu
@@ -957,3 +1027,8 @@ Run before every release:
 - ❌ `hasValidSession` vérifié avant `isDemoRequest` sur les routes d'écriture (session valide + cookie démo → fuite)
 - ❌ Route de logout du mode non-publique (proxy bloque le POST → cookie de mode jamais effaçable)
 - ❌ `issueSessionResponse` sans `clearModeCookie` (ancien cookie de mode survit au login normal)
+- ❌ `tenant_id` dans un cookie séparé, surtout non-httpOnly (falsifiable côté client)
+- ❌ Changement de tenant par swap de cookie sans révoquer la session (session A toujours valide sur tenant B)
+- ❌ `tenantId` lu du body/params pour scoper les queries (injection de tenant arbitraire)
+- ❌ `WHERE id = ?` sans `AND tenant_id = ?` sur les mutations (cross-tenant write/delete silencieux)
+- ❌ Impersonation admin sans contexte isolé (admin agit avec ses propres droits sur le tenant cible)
