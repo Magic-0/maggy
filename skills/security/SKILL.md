@@ -416,62 +416,296 @@ if (!filePath.startsWith(path.resolve('./uploads'))) {
 
 ## Authentication & Authorization
 
-### Mode Cookie Isolation (demo / preview / guest)
+### Secure Cookies (httpOnly Sessions)
 
-A mode cookie (`demo`, `preview`, `guest`…) and a real session cookie must **never coexist**. When both are present simultaneously, read guards return mode fixtures while write guards see `hasValidSession → true` — meaning mode actions write to the real database (spurious notifications, data corruption, etc.).
-
-**4 mandatory rules:**
-
-1. **Entering a mode → revoke the real session first.** The mode entry route (`/api/auth/demo`, `/api/auth/preview`…) must read the session token, revoke it in the database, and clear its cookie BEFORE setting the mode cookie.
-
-2. **Login → clear the mode cookie.** `issueSessionResponse` (and every session-issuance code path, including 2FA) must call `clearModeCookie(response)`. Guarantees that even if rule #1 failed, logging in normalises the state.
-
-3. **Write routes → mode guard BEFORE session guard.** On every `POST`/`PATCH`/`DELETE` handler, check `isDemoRequest(req)` first. If in mode → return without touching the database. Never let `hasValidSession` alone decide writes when a mode cookie may be present.
-
-4. **Mode logout = PUBLIC route.** The logout route must bypass the session middleware (`PUBLIC_PATHS` or equivalent). Without this, a `POST` from inside the mode (no real session) is blocked by the proxy and the mode cookie can never be cleared.
+Pour toute session utilisateur, toujours utiliser des cookies `httpOnly` — jamais de token dans `localStorage` (vulnérable XSS).
 
 ```typescript
-// ✅ CORRECT — mode entry: revoke real session first
-export async function POST(req: Request) {
-  const response = NextResponse.json({ ok: true })
-  const token = readSessionToken(req)
-  if (token) {
-    try { await revokeSessionByToken(token) } catch {}
-    response.cookies.set(SESSION_COOKIE_NAME, "", { maxAge: 0, path: "/" })
-  }
-  return setModeCookie(response)
+// Pattern cookie de session — Next.js App Router
+response.cookies.set("session", token, {
+  httpOnly: true,           // Inaccessible depuis JS client
+  sameSite: "lax",          // Protection CSRF (lax = ok pour navigations GET, bloque POST cross-site)
+  secure:   process.env.NODE_ENV === "production",  // HTTPS only en prod
+  path:     "/",
+  maxAge:   7 * 24 * 60 * 60,  // 7 jours en secondes
+})
+```
+
+**Règles :**
+- `httpOnly: true` toujours — sans exception
+- `sameSite: "strict"` si pas de navigation cross-site ; `"lax"` sinon
+- `secure: true` en production (jamais en dev local HTTP)
+- `maxAge` explicite — pas de cookie session sans expiration définie
+
+---
+
+### Two-Factor Authentication (TOTP RFC 6238)
+
+Pattern pour 2FA basé sur authenticator (Google Authenticator, 1Password, Authy).
+
+#### Flow en 2 étapes avec cookie pending
+
+```
+POST /api/auth/login    → vérifie email+password
+  ├─ 2FA désactivé     → cookie session définitive
+  └─ 2FA activé        → cookie pending JWT (TTL court ~5 min)
+        ↓
+POST /api/auth/login/2fa → vérifie code TOTP
+  ├─ code valide       → cookie session définitive + suppression cookie pending
+  └─ code invalide     → 401 (rate limité)
+```
+
+```typescript
+// lib/auth-pending.ts — cookie temporaire JWT entre les 2 étapes
+import { SignJWT, jwtVerify } from "jose"
+
+const PENDING_TTL_S = 5 * 60  // 5 minutes max pour saisir le code TOTP
+
+export async function signPendingAuth(userId: string): Promise<string> {
+  return new SignJWT({ userId })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(`${PENDING_TTL_S}s`)
+    .sign(getEncryptionKey())  // clé 32 bytes depuis env var
 }
 
-// ✅ CORRECT — login: clear mode cookie on session issuance
-async function issueSessionResponse(...): Promise<NextResponse> {
-  // ... set real session cookie ...
-  return clearModeCookie(response)  // ← always, last line
-}
+// Poser le cookie pending
+response.cookies.set("auth_pending", jwt, {
+  httpOnly: true, sameSite: "lax",
+  secure: process.env.NODE_ENV === "production",
+  path: "/", maxAge: PENDING_TTL_S,
+})
 
-// ✅ CORRECT — write route: mode guard before session guard
-export async function POST(req: Request) {
-  if (isDemoRequest(req)) return NextResponse.json({ ok: true })  // ← first check
-  if (!(await hasValidSession(req))) return unauthorized()
-  // ... DB write only if real session confirmed ...
-}
+// Destruction après validation 2FA
+response.cookies.set("auth_pending", "", { maxAge: 0, path: "/" })
+```
 
-// ❌ WRONG — mode entry without clearing the existing session
-export async function POST() {
-  return setModeCookie(NextResponse.json({ ok: true }))  // real session still valid!
-}
+#### Setup TOTP (otplib)
 
-// ❌ WRONG — write route without mode guard
-export async function POST(req: Request) {
-  if (!(await hasValidSession(req))) return unauthorized()  // session valid in demo → write!
-  await db`INSERT INTO ...`
+```typescript
+import { generateSecret, generateURI, verifySync } from "otplib"
+import { toDataURL } from "qrcode"
+
+// Générer un secret base32 (160 bits)
+const secret = generateSecret()
+
+// URI pour QR code (standard otpauth://)
+const uri = generateURI({ issuer: "MonApp", label: userEmail, secret })
+const qrDataUrl = await toDataURL(uri, { errorCorrectionLevel: "M", scale: 6 })
+
+// Vérifier un code (±30s de tolérance pour dérives d'horloge)
+function verifyTotpCode(secret: string, code: string): boolean {
+  const clean = code.replace(/\s/g, "")
+  if (!/^\d{6}$/.test(clean)) return false
+  try {
+    return verifySync({ secret, token: clean, epochTolerance: 30 })?.valid === true
+  } catch { return false }
 }
 ```
 
-**Anti-patterns:**
-- ❌ Setting a mode cookie without revoking the existing real session
-- ❌ Checking `hasValidSession` before `isDemoRequest` on write routes
-- ❌ Mode logout guarded by the proxy (non-public route → POST blocked from within the mode)
-- ❌ `issueSessionResponse` that does not clear active mode cookies
+#### Backup codes one-shot
+
+```typescript
+// 10 codes × 8 chars base32, consommables une seule fois
+function generateBackupCodes(): string[] {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+  return Array.from({ length: 10 }, () => {
+    const arr = new Uint8Array(8)
+    crypto.getRandomValues(arr)
+    return Array.from(arr).map(b => alphabet[b % alphabet.length]).join("")
+  })
+}
+
+// Vérification + consommation (one-shot — retire le code de la liste)
+async function consumeBackupCode(userId: string, code: string): Promise<boolean> {
+  const row = await loadTotpRow(userId)
+  let matched = false
+  const remaining = row.backup_codes_enc.filter(enc => {
+    if (!matched && decrypt(enc) === code) { matched = true; return false }
+    return true
+  })
+  if (matched) await db`UPDATE user_totp SET backup_codes_enc = ${remaining} WHERE user_id = ${userId}`
+  return matched
+}
+```
+
+---
+
+### Chiffrement AES-256-GCM pour secrets en DB
+
+Ne jamais stocker un secret (TOTP, clé API...) en clair en base. Utiliser AES-256-GCM (chiffrement **authentifié** — détecte toute falsification).
+
+```typescript
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto"
+
+// Format de sortie : iv_hex:tag_hex:ciphertext_hex
+// Clé : 32 bytes (64 hex chars) depuis ENCRYPTION_KEY env var
+
+export function encryptSecret(plaintext: string): string {
+  const key = getKeyFromEnv()               // Buffer 32 bytes
+  const iv  = randomBytes(12)               // 96 bits — recommandé GCM
+  const cipher = createCipheriv("aes-256-gcm", key, iv)
+  const ct  = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()])
+  const tag = cipher.getAuthTag()           // 128 bits — intégrité
+  return `${iv.toString("hex")}:${tag.toString("hex")}:${ct.toString("hex")}`
+}
+
+export function decryptSecret(encoded: string): string {
+  const [ivHex, tagHex, ctHex] = encoded.split(":")
+  const key     = getKeyFromEnv()
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"))
+  decipher.setAuthTag(Buffer.from(tagHex, "hex"))  // throw si MAC invalide
+  return Buffer.concat([
+    decipher.update(Buffer.from(ctHex, "hex")),
+    decipher.final(),
+  ]).toString("utf8")
+}
+
+function getKeyFromEnv(): Buffer {
+  const hex = process.env.ENCRYPTION_KEY?.trim() ?? ""
+  if (hex.length !== 64 || !/^[0-9a-fA-F]+$/.test(hex))
+    throw new Error("ENCRYPTION_KEY invalide — doit être 64 hex chars (32 bytes)")
+  return Buffer.from(hex, "hex")
+}
+// Générer une clé : node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+**Règles :**
+- IV aléatoire différent à chaque chiffrement (jamais réutilisé)
+- `getAuthTag()` après `final()` — obligatoire pour l'authenticité
+- Rotation de clé = re-chiffrement de toutes les données existantes
+
+---
+
+### Anti-Enumeration & Timing Attack
+
+```typescript
+// Ne PAS court-circuiter le hash si l'utilisateur n'existe pas
+// (sinon la différence de timing révèle si l'email existe)
+const user = await findUserByEmail(email)
+const hashToCheck = user?.password_hash
+  ?? "$2b$12$0000000000000000000000000000000000000000000000000000XX"
+const passwordOk = await bcrypt.compare(password, hashToCheck)
+
+if (!user || !passwordOk) {
+  // Message générique — pas "email inconnu" ni "mauvais mot de passe"
+  return res.status(401).json({ error: "Identifiants incorrects" })
+}
+```
+
+**Règles :**
+- Message d'erreur **toujours identique** (pas de distinction email/password invalide)
+- Auth par **email uniquement** — évite l'énumération via usernames courts (`admin`, `root`…)
+- Hash factice du même coût que bcrypt pour équilibrer le timing
+
+---
+
+### Password Strength Validation
+
+Au-delà du hash, valider la complexité avant d'accepter un mot de passe :
+
+```typescript
+function validatePasswordStrength(password: string): string | null {
+  if (password.length < 16)            return "Minimum 16 caractères requis."
+  if (!/[a-z]/.test(password))        return "Au moins une lettre minuscule."
+  if (!/[A-Z]/.test(password))        return "Au moins une lettre majuscule."
+  if (!/\d/.test(password))           return "Au moins un chiffre."
+  if (!/[^a-zA-Z\d]/.test(password)) return "Au moins un caractère spécial."
+  return null
+}
+// Appeler AVANT hashPassword, côté serveur (pas uniquement côté client)
+```
+
+---
+
+### Tokens de reset one-shot (SHA-256)
+
+Ne jamais stocker un token de reset en clair — le hacher avant persistance :
+
+```typescript
+import crypto from "crypto"
+
+// Génération (côté serveur, envoyé par email)
+const rawToken = crypto.randomBytes(32).toString("hex")
+
+// Stockage (seulement le hash, jamais le raw)
+const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex")
+await db`INSERT INTO reset_tokens (token_hash, user_id, expires_at, used)
+         VALUES (${tokenHash}, ${userId}, NOW() + INTERVAL '1 hour', false)`
+
+// Vérification
+const hash = crypto.createHash("sha256").update(req.token).digest("hex")
+const row  = await db`SELECT * FROM reset_tokens
+                      WHERE token_hash = ${hash} AND used = false AND expires_at > NOW()`
+```
+
+---
+
+### Bearer Token pour routes internes (Cron / Worker)
+
+Protéger les routes non-utilisateur (cron jobs, workers) par un secret partagé :
+
+```typescript
+// lib/auth-bearer.ts
+export function authorizedBearer(req: Request, secretEnv: "CRON_SECRET" | "WORKER_SECRET"): boolean {
+  const secret = process.env[secretEnv]
+  if (!secret) return false
+  return req.headers.get("authorization") === `Bearer ${secret}`
+}
+
+// Usage dans une route
+export async function POST(req: Request) {
+  if (!authorizedBearer(req, "CRON_SECRET"))
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  // ...
+}
+```
+
+**Règles :**
+- Secrets à entropie maximale (64+ hex chars = 32 bytes random)
+- Ne jamais logger ou exposer ces secrets côté client
+- Stocker dans les env vars serveur (jamais `NEXT_PUBLIC_*`)
+
+---
+
+### Rate Limiting (Next.js / Vercel Serverless)
+
+```typescript
+// lib/rate-limit.ts — sliding window in-memory
+// ⚠️ Non partagé entre instances Lambda. Pour usage critique → Upstash Ratelimit + Vercel KV
+
+interface Bucket { count: number; resetAt: number }
+const buckets = new Map<string, Bucket>()
+const MAX_KEYS = 5000  // cap mémoire
+
+export function rateLimit(req: Request, scope: string, max: number, windowMs: number): NextResponse | null {
+  const ip  = req.headers.get("x-forwarded-for")?.split(",")[0].trim() ?? "local"
+  const key = `${scope}:${ip}`
+  const now = Date.now()
+
+  // Eviction des buckets expirés si cap atteint
+  if (buckets.size >= MAX_KEYS)
+    for (const [k, b] of buckets) if (b.resetAt < now) buckets.delete(k)
+
+  const b = buckets.get(key)
+  if (!b || b.resetAt < now) { buckets.set(key, { count: 1, resetAt: now + windowMs }); return null }
+  if (b.count >= max) {
+    const retryAfter = Math.ceil((b.resetAt - now) / 1000)
+    return NextResponse.json(
+      { error: "Trop de tentatives — réessayez plus tard" },
+      { status: 429, headers: { "Retry-After": String(retryAfter) } },
+    )
+  }
+  b.count++
+  return null
+}
+
+// Limites recommandées par endpoint
+// login          : 5 req / 15 min
+// login/2fa      : 5 req / 15 min
+// forgot-password: 3 req / 60 min
+// reset-password : 5 req / 60 min
+```
 
 ---
 
@@ -598,12 +832,19 @@ Run before every release:
 
 ### Authentication
 - [ ] Passwords hashed with bcrypt (12+ rounds)
+- [ ] Password strength validated server-side (16+ chars, maj+min+chiffre+spécial)
 - [ ] JWTs use short expiration
-- [ ] Rate limiting on auth endpoints
-- [ ] Session tokens rotated on login
-- [ ] Mode isolation: entering a mode revokes real session; login clears mode cookie
-- [ ] Write routes: mode guard (`isDemoRequest`…) checked BEFORE `hasValidSession`
-- [ ] Mode logout route is PUBLIC (reachable without a real session)
+- [ ] Rate limiting on auth endpoints (5/15min login, 3/60min forgot-password)
+- [ ] Session tokens rotated on login (crypto.randomBytes)
+- [ ] Cookies : httpOnly + sameSite + secure (prod) + maxAge explicite
+- [ ] Auth par email uniquement (pas username) — anti-enumeration
+- [ ] Message d'erreur générique "Identifiants incorrects" (pas email/password distinct)
+- [ ] Timing attack mitigé : hash factice si user inconnu
+- [ ] Reset tokens : hash SHA-256 avant stockage, one-shot + TTL court
+- [ ] 2FA TOTP si disponible : cookie pending JWT (5 min) entre les 2 étapes
+- [ ] Secrets TOTP chiffrés AES-256-GCM en DB (jamais en clair)
+- [ ] Backup codes 2FA : one-shot, chiffrés en DB, consommés à l'usage
+- [ ] Routes internes (cron/worker) protégées par Bearer token haute entropie
 
 ### Database
 - [ ] Parameterized queries only
@@ -640,7 +881,13 @@ Run before every release:
 - ❌ Running as root / admin in production
 - ❌ Hardcoded credentials for any environment
 - ❌ Disabling SSL/TLS verification
-- ❌ Mode cookie set without revoking the existing real session (coexistence → real DB writes from mode)
-- ❌ `hasValidSession` checked before mode guard on write routes (valid session + demo cookie → leak)
-- ❌ Mode logout route not in PUBLIC paths (proxy blocks the POST → mode cookie can never be cleared)
-- ❌ `issueSessionResponse` without `clearModeCookie` (old mode cookie survives normal login)
+- ❌ Cookies sans `httpOnly` (exposés au JS client — vol XSS)
+- ❌ Cookies sans `sameSite` (CSRF possible)
+- ❌ Token de session dans `localStorage` ou `sessionStorage`
+- ❌ Stocker un secret TOTP ou backup code en clair en DB
+- ❌ Court-circuiter le hash si l'utilisateur n'existe pas (timing oracle)
+- ❌ Message "email inconnu" ou "mauvais mot de passe" distinct (enumeration)
+- ❌ Auth par username court (`admin`, `root`) — préférer email
+- ❌ Token de reset stocké en clair — toujours SHA-256 avant persistance
+- ❌ Bearer secret < 32 bytes d'entropie (utiliser `crypto.randomBytes(32).toString("hex")`)
+- ❌ Rate limit uniquement côté client (doit être côté serveur, par IP)
