@@ -439,6 +439,65 @@ response.cookies.set("session", token, {
 
 ---
 
+### Isolation des modes (démo / preview / guest)
+
+Un cookie de mode (`demo`, `preview`, `guest`…) et un cookie de session réelle ne doivent **jamais coexister**. La coexistence crée une ambiguïté dangereuse : les guards de lecture retournent des fixtures démo, mais les guards d'écriture voient `hasValidSession → true` → les actions du mode écrivent en DB réelle (notifications parasites, données corrompues…).
+
+**4 règles non négociables :**
+
+1. **Entrée en mode → révoquer la session réelle** : la route d'entrée (`/api/auth/demo`…) lit le cookie session, le révoque en DB, et l'efface dans la réponse AVANT de poser le cookie de mode.
+
+2. **Login → effacer le cookie de mode** : `issueSessionResponse` (et tout chemin d'émission de session, y compris 2FA) doit appeler `clearModeCookie(response)`. Garantit que même si l'étape 1 a échoué, le login normalise l'état.
+
+3. **Routes d'écriture → mode guard AVANT session guard** : sur tout handler `POST/PATCH/DELETE`, vérifier `isDemoRequest(req)` en premier. Si mode → retourner sans toucher la DB. Ne jamais laisser `hasValidSession` seul décider pour les writes en présence d'un cookie de mode.
+
+4. **Logout du mode = route PUBLIC** : la route de logout doit bypasser le middleware de session (`PUBLIC_PATHS` ou équivalent). Sans ça, un POST de logout depuis le mode (sans vraie session) est bloqué par le proxy, le cookie de mode ne peut jamais être effacé.
+
+```typescript
+// ✅ CORRECT — entrée en mode : révoque la session réelle en premier
+export async function POST(req: Request) {
+  const response = NextResponse.json({ ok: true })
+  const token = readSessionToken(req)
+  if (token) {
+    try { await revokeSessionByToken(token) } catch {}
+    response.cookies.set(SESSION_COOKIE_NAME, "", { maxAge: 0, path: "/" })
+  }
+  return setModeCookie(response)
+}
+
+// ✅ CORRECT — login : purge le cookie de mode
+async function issueSessionResponse(...): Promise<NextResponse> {
+  // ... générer et poser le vrai cookie session ...
+  return clearModeCookie(response)  // ← toujours, en dernier
+}
+
+// ✅ CORRECT — route write : mode guard en premier, avant session guard
+export async function POST(req: Request) {
+  if (isDemoRequest(req)) return NextResponse.json({ ok: true })  // ← prioritaire
+  if (!(await hasValidSession(req))) return unauthorized()
+  // ... écriture DB uniquement si vraie session confirmée ...
+}
+
+// ❌ MAUVAIS — entrée en mode sans effacer la session
+export async function POST() {
+  return setModeCookie(NextResponse.json({ ok: true }))  // e208_session toujours valide!
+}
+
+// ❌ MAUVAIS — write route sans mode guard
+export async function POST(req: Request) {
+  if (!(await hasValidSession(req))) return unauthorized()  // session valide en démo → écriture!
+  await db`INSERT INTO ...`
+}
+```
+
+**Anti-patterns :**
+- ❌ Poser un cookie de mode sans effacer le cookie session existant
+- ❌ Vérifier `hasValidSession` AVANT `isDemoRequest` sur les routes d'écriture
+- ❌ Logout du mode gardé par le proxy (route non-publique → POST bloqué depuis le mode)
+- ❌ `issueSessionResponse` qui ne purge pas les cookies de mode actifs
+
+---
+
 ### Two-Factor Authentication (TOTP RFC 6238)
 
 Pattern pour 2FA basé sur authenticator (Google Authenticator, 1Password, Authy).
@@ -837,6 +896,9 @@ Run before every release:
 - [ ] Rate limiting on auth endpoints (5/15min login, 3/60min forgot-password)
 - [ ] Session tokens rotated on login (crypto.randomBytes)
 - [ ] Cookies : httpOnly + sameSite + secure (prod) + maxAge explicite
+- [ ] Isolation des modes : entrée en mode → session révoquée ; login → cookie de mode effacé
+- [ ] Routes d'écriture : mode guard (`isDemoRequest`…) vérifié AVANT `hasValidSession`
+- [ ] Logout du mode dans `PUBLIC_PATHS` (atteignable sans vraie session)
 - [ ] Auth par email uniquement (pas username) — anti-enumeration
 - [ ] Message d'erreur générique "Identifiants incorrects" (pas email/password distinct)
 - [ ] Timing attack mitigé : hash factice si user inconnu
@@ -891,3 +953,7 @@ Run before every release:
 - ❌ Token de reset stocké en clair — toujours SHA-256 avant persistance
 - ❌ Bearer secret < 32 bytes d'entropie (utiliser `crypto.randomBytes(32).toString("hex")`)
 - ❌ Rate limit uniquement côté client (doit être côté serveur, par IP)
+- ❌ Cookie de mode posé sans révoquer la session réelle (coexistence → writes en DB réelle depuis le mode)
+- ❌ `hasValidSession` vérifié avant `isDemoRequest` sur les routes d'écriture (session valide + cookie démo → fuite)
+- ❌ Route de logout du mode non-publique (proxy bloque le POST → cookie de mode jamais effaçable)
+- ❌ `issueSessionResponse` sans `clearModeCookie` (ancien cookie de mode survit au login normal)
